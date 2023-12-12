@@ -1,0 +1,1137 @@
+---
+title: "Parkinson_micro-array"
+author: "Alejandro Ponce"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+    theme: cerulean
+editor_options: 
+  chunk_output_type: inline
+---
+
+\# Data Analysis Workflow in R
+
+This document outlines the steps for analyzing a microarray dataset in R, focusing on identifying potential biomarkers for a disease.
+
+\## Preliminaries
+
+Make sure you have installed the necessary R packages like \`limma\`, \`ggplot2\`, and others relevant for microarray analysis.
+
+## **1: Load data**
+
+```{r message=FALSE, warning=FALSE}
+# Load necessary libraries
+library(ggplot2)
+library(limma)
+library(readr)
+library(GEOquery)
+library(sva)
+library(tidyr)
+library(knitr)
+library(pheatmap)
+library(biomaRt)
+library(tidyverse)
+library(hgu133plus2.db)
+library(AnnotationDbi)
+library(preprocessCore)
+library(viridis)
+library(dplyr)
+library(WGCNA)
+library(parallel)
+library(reshape2)
+library(ggVennDiagram)
+library(randomForestSRC)
+library(survival)
+library(survminer)
+library(gridExtra)
+library(ggpubr)
+library(ggsignif)
+library(stringdist)
+
+```
+
+### Load data and metadata
+
+```{r EVAL = FALSE}
+
+# Read the series matrix file
+gse = getGEO(filename = "Files/GSE108476-GPL570_series_matrix.txt.gz") 
+
+```
+
+```{r message=FALSE, warning=FALSE}
+# clinical data
+file_path <- "Files/GSE108474_REMBRANDT_clinical.data.txt.gz"
+clinical_data <- read_delim(file_path, delim = "\t", escape_double = FALSE, trim_ws = TRUE)
+
+```
+
+### Extract data from gse object
+
+```{r EVAL = FALSE}
+# Get the expression matrix
+expressionMatrix <- exprs(gse)
+
+# Get the metadata
+metadata <- pData(phenoData(gse))
+
+# Convert to character if they are not already
+metadata$title <- as.character(metadata$title)
+clinical_data$SUBJECT_ID <- as.character(clinical_data$SUBJECT_ID)
+# Merging datasets
+metadata <- merge(metadata, clinical_data, by.x = "title", by.y = "SUBJECT_ID", all.x = TRUE)
+
+# Filter metadata for Glioblastoma and Normal
+selected_groups <- c("normal", "glioblastoma multiforme")
+glioblastoma_metadata <- metadata[metadata$`disease:ch1` %in% selected_groups, ]
+rownames(glioblastoma_metadata) <- glioblastoma_metadata$geo_accession
+
+# List of columns to keep
+# Specify the columns you want to keep
+columns_to_keep <- c("title", "geo_accession", "characteristics_ch1.1", "disease:ch1", 
+                     "tumor grade:ch1", "AGE_RANGE", "GENDER", "EVENT_OS", 
+                     "OVERALL_SURVIVAL_MONTHS", "DISEASE_TYPE", "WHO_GRADE", 
+                     "RACE", "KARNOFSKY", "NEURO_EXAM_SCORE")
+
+# Subset the dataframe to keep only these columns
+glioblastoma_metadata <- glioblastoma_metadata[, columns_to_keep]
+
+
+# Filter the expression matrix to keep only selected samples
+glioblastoma_expressionMatrix <- expressionMatrix[, colnames(expressionMatrix) %in% rownames(glioblastoma_metadata)]
+
+# Verify the number of samples and their groups
+table(glioblastoma_metadata$`disease:ch1`)
+
+# Check the dimensions of the filtered expression matrix
+dim(glioblastoma_expressionMatrix)
+
+```
+
+## **2: Data Preprocessing**
+
+Retrieve Gene Names
+
+```{r}
+# Extract feature data
+featureData <- fData(gse)
+
+# and the column with gene symbols is named 'GeneSymbol'
+probe_to_gene <- featureData$'Gene Symbol'
+names(probe_to_gene) <- featureData$ID
+
+# Update row names
+new_row_names <- probe_to_gene[rownames(glioblastoma_expressionMatrix)]
+
+# Handle probes without a gene symbol
+new_row_names[is.na(new_row_names)] <- rownames(glioblastoma_expressionMatrix)[is.na(new_row_names)]
+
+# Set the new row names
+rownames(glioblastoma_expressionMatrix) <- new_row_names
+
+
+```
+
+### Remove NAs
+
+```{r fig.width=10, warning=FALSE}
+
+# Number of samples before filtering
+numSamplesBefore <- ncol(glioblastoma_expressionMatrix)
+cat("Number of samples before filtering:", numSamplesBefore, "\n")
+
+# Remove columns with any NA values
+glioblastoma_expressionMatrix <- glioblastoma_expressionMatrix[, colSums(is.na(glioblastoma_expressionMatrix)) == 0]
+# Get the list of remaining sample names (column names) in the expression matrix
+remaining_samples <- colnames(glioblastoma_expressionMatrix)
+# Filter the metadata to keep only rows corresponding to the remaining samples
+glioblastoma_metadata <- glioblastoma_metadata[glioblastoma_metadata$geo_accession %in% remaining_samples, ]
+
+# Number of samples after filtering
+numSamplesAfter <- ncol(glioblastoma_expressionMatrix)
+cat("Number of samples after filtering:", numSamplesAfter, "\n")
+
+
+```
+
+Get some info on sample distribution
+
+```{r}
+# Create a contingency table of gender distribution within each disease group
+gender_distribution <- table(glioblastoma_metadata$`disease:ch1`, glioblastoma_metadata$GENDER)
+
+# View the table
+print(gender_distribution)
+
+```
+
+## **3: Statistical Analysis**
+
+### **Aligning Sample Information**
+
+```{r}
+
+# Replace special characters (e.g., '///') with a standard delimiter, like '|'
+standardized_gene_names <- gsub(" /// ", "_", rownames(glioblastoma_expressionMatrix))
+
+# Function to add numeration to duplicated gene names
+enumerate_duplicates <- function(genes) {
+  unique_genes <- unique(genes)
+  enumerated_genes <- genes
+
+  for (gene in unique_genes) {
+    duplicate_indices <- which(genes == gene)
+
+    if (length(duplicate_indices) > 1) {
+      for (i in seq_along(duplicate_indices)) {
+        enumerated_genes[duplicate_indices[i]] <- paste0(gene, ifelse(i == 1, "", i - 1))
+      }
+    }
+  }
+
+  return(enumerated_genes)
+}
+
+# Apply enumeration to standardized gene names
+enumerated_gene_names <- enumerate_duplicates(standardized_gene_names)
+
+# Update row names in the expression matrix
+rownames(glioblastoma_expressionMatrix) <- enumerated_gene_names
+
+```
+
+Create design matrix
+
+```{r}
+# Create a factor vector for the sample types
+sample_types <- glioblastoma_metadata$`disease:ch1`
+
+# Ensure the order matches the columns of the expression matrix
+sample_types <- factor(sample_types[match(colnames(glioblastoma_expressionMatrix), glioblastoma_metadata$geo_accession)])
+
+# Adjust factor levels to replace spaces with underscores
+levels(sample_types) <- gsub(" ", "_", levels(sample_types))
+
+# Create the design matrix
+design <- model.matrix(~ 0 + sample_types)
+colnames(design) <- levels(sample_types)
+contrast.matrix <- makeContrasts(GlioblastomaVsNormal = `glioblastoma_multiforme` - normal, levels = design)
+
+```
+
+### **Differential Expression Analysis with Limma**
+
+```{r}
+
+# Fit the linear model
+fit <- lmFit(glioblastoma_expressionMatrix, design)
+
+# Apply the contrast matrix
+fit2 <- contrasts.fit(fit, contrast.matrix)
+
+# Compute the empirical Bayes statistics
+fit2 <- eBayes(fit2)
+
+# Extract the results for the comparison 
+results <- topTable(fit2, coef = "GlioblastomaVsNormal", number = Inf, adjust.method = "BH")
+
+
+
+```
+
+Volcano Plot
+
+```{r message=FALSE, warning=FALSE}
+# Prepare labels
+data <- results %>%
+  mutate(
+    Expression = case_when(
+      logFC >= log(2) & adj.P.Val <= 0.05 ~ "Up-regulated",
+      logFC <= -log(2) & adj.P.Val <= 0.05 ~ "Down-regulated",
+      TRUE ~ "Not significant"
+    )
+  )
+
+volcano <- ggplot(data, aes(x = logFC, y = -log10(P.Value), color = Expression)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("Not significant" = "#A9A9A9", "Up-regulated" = "#B22222", "Down-regulated" = "#4682B4")) +
+  theme_bw() +
+  labs(title = "Volcano Plot: Control vs Glioblastoma",
+       x = "Log FC", y = "-Log10 P-value",
+       color = "Expression Status") +
+  theme(legend.position = "right")
+
+# Show and save Plot
+volcano
+ggsave("Plots/volcano .png", volcano)
+
+
+```
+
+Heat-map
+
+```{r fig.width=10, message=FALSE, warning=FALSE}
+
+# Step 1: Create and structure the annotation dataframe
+annotation_df <- data.frame(SampleName = glioblastoma_metadata$geo_accession, Group = glioblastoma_metadata$`disease:ch1`)
+annotation_df <- annotation_df[match(colnames(glioblastoma_expressionMatrix), annotation_df$SampleName),]
+
+# Step 2: Select the top 20 genes 
+significant_genes <- results[results$adj.P.Val < 0.01, ]
+top_genes <- significant_genes$ID[order(significant_genes$B, decreasing = TRUE)][1:100]
+
+# Step 3: Extract and scale data for the top genes
+top_genes_data <- glioblastoma_expressionMatrix[top_genes, ]
+
+# Step 4: # Ensure that the samples matches the sample order in annotation_df
+annotation_df_filtered <- annotation_df[annotation_df$Group %in% c("normal", "glioblastoma multiforme"), ]
+# only the samples present in annotation_df_filtered
+top_genes_data_filtered <- top_genes_data[, colnames(top_genes_data) %in% annotation_df_filtered$SampleName]
+# order of columns matches
+annotation_df_filtered <- annotation_df_filtered[order(annotation_df_filtered$Group), ]
+top_genes_data_ordered <- top_genes_data_filtered[, match(annotation_df_filtered$SampleName, colnames(top_genes_data_filtered))]
+
+# Set samplename as row names
+rownames(annotation_df_filtered) <- annotation_df_filtered$SampleName
+annotation_df_filtered <- annotation_df_filtered[, -which(names(annotation_df_filtered) == "SampleName"), drop = FALSE]
+
+# Replace dots in row names with another character (e.g., underscore)
+rownames(top_genes_data_ordered) <- gsub("\\.", "_", rownames(top_genes_data_ordered))
+
+# Apply z-score normalization
+# Transpose the data to normalize across genes 
+normalized_data <- t(scale(t(top_genes_data_ordered)))
+# convert it back to a dataframe
+normalized_data <- as.data.frame(normalized_data)
+# Setting row and column names as in the original data
+rownames(normalized_data) <- rownames(top_genes_data_ordered)
+colnames(normalized_data) <- colnames(top_genes_data_ordered)
+
+# Step 5: Draw the heatmap with sample annotations
+heatmap <- pheatmap(normalized_data , 
+         cluster_rows = TRUE, 
+         cluster_cols = FALSE,
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         annotation_col = annotation_df_filtered,  # annotations
+         show_rownames = FALSE, 
+         show_colnames = FALSE,  
+         main = "Top Genes Heatmap",
+         color = viridis(256))
+
+# Show and save Plot
+heatmap
+ggsave("Plots/heatmap.png", heatmap)
+
+```
+
+## 
+
+## **6: Exploratory/Network Analysis**
+
+### PCA
+
+Prepare data
+
+```{r}
+
+# Transpose the matrix for PCA
+transposed_expression <- t(glioblastoma_expressionMatrix)
+
+
+```
+
+Perform PCA
+
+```{r}
+# Performing PCA
+pca_result <- prcomp(transposed_expression, center = TRUE, scale. = TRUE)
+
+```
+
+Plot
+
+```{r message=FALSE, warning=FALSE}
+
+# rownames(pca_result$x) matched with glioblastoma_metadata$geo_accession
+ordered_groups <- glioblastoma_metadata$`disease:ch1`[match(rownames(pca_result$x), glioblastoma_metadata$geo_accession)]
+
+# Create a data frame for PCA plot
+pca_data <- data.frame(Sample = rownames(pca_result$x), 
+                       PC1 = pca_result$x[, 1], 
+                       PC2 = pca_result$x[, 2],
+                       Group = ordered_groups)
+
+# Ensure the Group factor levels are ordered
+pca_data$Group <- factor(pca_data$Group, levels = c("normal", "glioblastoma multiforme"))
+
+
+# Centroids
+centroids <- pca_data %>%
+  group_by(Group) %>%
+  summarize(Centroid_PC1 = mean(PC1),
+            Centroid_PC2 = mean(PC2))
+
+# Plotting PCA
+pca_plot <- ggplot(pca_data, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point() +  # Original data points
+  geom_point(data = centroids, aes(x = Centroid_PC1, y = Centroid_PC2),  # Centroids
+             size = 3, shape = 4) +  # Adjust size and shape as needed
+  stat_ellipse(type = "t", level = 0.95) +  # Ellipses around groups
+  labs(title = "PCA of Gene Expression Data",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Group") +
+  theme_bw()
+
+# Show and save Plot
+pca_plot
+ggsave("Plots/PCA.png", pca_plot)
+```
+
+Identify genes that contribute more to separation
+
+```{r}
+# Extract loadings
+loadings <- pca_result$rotation
+
+# Extract the loadings for the first principal component (PC1)
+pc1_loadings <- loadings[, 1]
+
+# Sort the loadings by their absolute values to find the most contributing genes
+important_genes_pc1 <- sort(abs(pc1_loadings), decreasing = TRUE)
+
+top_genes_pc1 <- names(important_genes_pc1)[1:100]
+
+
+```
+
+Plot top genes
+
+```{r message=FALSE, warning=FALSE}
+# Step 1: Create and structure the annotation dataframe
+annotation_df <- data.frame(SampleName = glioblastoma_metadata$geo_accession, Group = glioblastoma_metadata$`disease:ch1`)
+annotation_df <- annotation_df[match(colnames(glioblastoma_expressionMatrix), annotation_df$SampleName),]
+
+# Step 2: Select the top 20 genes 
+top_genes <- top_genes_pc1[1:20]
+
+# Step 3: Extract and scale data for the top genes
+top_genes_data <- glioblastoma_expressionMatrix[top_genes, ]
+
+# Step 4: # Ensure that the samples matches the sample order in annotation_df
+annotation_df_filtered <- annotation_df[annotation_df$Group %in% c("normal", "glioblastoma multiforme"), ]
+# only the samples present in annotation_df_filtered
+top_genes_data_filtered <- top_genes_data[, colnames(top_genes_data) %in% annotation_df_filtered$SampleName]
+# order of columns matches
+annotation_df_filtered <- annotation_df_filtered[order(annotation_df_filtered$Group), ]
+top_genes_data_ordered <- top_genes_data_filtered[, match(annotation_df_filtered$SampleName, colnames(top_genes_data_filtered))]
+
+# Set samplename as row names
+rownames(annotation_df_filtered) <- annotation_df_filtered$SampleName
+annotation_df_filtered <- annotation_df_filtered[, -which(names(annotation_df_filtered) == "SampleName"), drop = FALSE]
+
+# Replace dots in row names with another character (e.g., underscore)
+rownames(top_genes_data_ordered) <- gsub("\\.", "_", rownames(top_genes_data_ordered))
+
+# Apply z-score normalization
+# Transpose the data to normalize across genes 
+normalized_data <- t(scale(t(top_genes_data_ordered)))
+# convert it back to a dataframe
+normalized_data <- as.data.frame(normalized_data)
+# Setting row and column names as in the original data
+rownames(normalized_data) <- rownames(top_genes_data_ordered)
+colnames(normalized_data) <- colnames(top_genes_data_ordered)
+
+# Step 5: Draw the heatmap with sample annotations
+heatmap <- pheatmap(normalized_data , 
+         cluster_rows = TRUE, 
+         cluster_cols = FALSE,
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         annotation_col = annotation_df_filtered,  # annotations
+         show_rownames = TRUE, 
+         show_colnames = FALSE,  
+         main = "Top PCA Genes",
+         color = viridis(256))
+
+# Show and save Plot
+heatmap
+ggsave("Plots/heatmap.png", heatmap)
+```
+
+### WGCNA
+
+Check and Outliers and Filter Genes
+
+```{r}
+# Detect outliers
+gsg <- goodSamplesGenes(glioblastoma_expressionMatrix, verbose = 3)
+
+# Checking for bad samples
+if (!all(gsg$goodSamples)) {
+    cat("The following samples are outliers:\n")
+    print(names(gsg$goodSamples)[!gsg$goodSamples])
+} else {
+    cat("No outlier samples detected.\n")
+}
+
+# Checking for bad genes
+if (!all(gsg$goodGenes)) {
+    cat("The following genes have too many missing values:\n")
+    print(names(gsg$goodGenes)[!gsg$goodGenes])
+} else {
+    cat("No genes with excessive missing values detected.\n")
+}
+
+
+```
+
+Set Parallel Computing
+
+```{r}
+# Detect the number of CPU cores
+nCores <- detectCores()
+# Set WGCNA to use multiple cores
+enableWGCNAThreads(nThreads = nCores)
+```
+
+Select Soft Tresholding Power
+
+```{r EVAL = FALSE}
+
+# numeric matrix
+datExpr <- as.matrix(t(glioblastoma_expressionMatrix))
+
+# Determine the soft-thresholding power
+powers <- c(1:10)  
+sft <- pickSoftThreshold(datExpr, powerVector = powers, verbose = 5)
+
+# Plotting the scale-free topology model fit
+sizeGrWindow(9, 5)
+par(mfrow = c(1, 2))
+cex1 = 0.9
+
+# Define the target value for the scale-free topology model fit
+target_fit <- 0.9
+
+# Plot 1: Scale-free topology model fit
+plot(sft$fitIndices[,1], sft$fitIndices[,2],
+     xlab="Soft Threshold (power)", ylab="Scale Free Topology Model Fit (R^2)",
+     type="n", main="Scale Independence")
+text(sft$fitIndices[,1], sft$fitIndices[,2],
+     labels=powers, cex=cex1, col="red")
+
+# Add a horizontal line at the target R^2 value
+abline(h=target_fit, col="blue", lwd=2, lty=2)
+
+# Add a legend or text to indicate the target line
+legend("bottomright", legend=paste("Target R^2 =", target_fit), col="blue", lwd=2, lty=2)
+
+
+# Plot 2: Mean connectivity
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)", ylab="Mean Connectivity",
+     type="n", main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5],
+     labels=powers, cex=cex1, col="red")
+
+```
+
+Create network and detect modules
+
+```{r EVAL = FALSE}
+
+# Parameters for blockwiseModules
+softThresholdPower = 7  # chosen power
+maxBlockSize = 5000     # Maximum block size
+
+# Run blockwiseModules
+net = blockwiseModules(datExpr, 
+                       power = softThresholdPower,  
+                       maxBlockSize = maxBlockSize,
+                       TOMType = "unsigned", 
+                       minModuleSize = 20,          
+                       deepSplit = 3,               
+                       mergeCutHeight = 0.15,       
+                       numericLabels = TRUE, 
+                       pamRespectsDendro = TRUE,    
+                       saveTOMs = TRUE,
+                       saveTOMFileBase = "TOMData",
+                       verbose = 2)
+
+
+# Extract module labels and colors
+moduleLabels = net$colors
+moduleColors = labels2colors(moduleLabels)
+
+# Extract the gene tree
+geneTree = net$dendrograms[[1]]
+
+
+```
+
+Relating Modules to External Traits
+
+```{r}
+# Extract the relevant traits
+traits <- glioblastoma_metadata[, c("geo_accession", "disease:ch1", "OVERALL_SURVIVAL_MONTHS", "tumor grade:ch1")]
+
+# Convert factors to numeric
+traits$`disease:ch1` <- as.numeric(traits$`disease:ch1` == "glioblastoma multiforme")
+traits$`tumor grade:ch1` <- as.numeric(gsub("grade ", "", traits$`tumor grade:ch1`))
+
+# Make sure the rows are in the same order as in the expression data
+traits <- traits[match(rownames(datExpr), traits$geo_accession), ]
+
+# Remove the geo_accession
+traits <- traits[, -which(names(traits) == "geo_accession")]
+
+# Calculate Module Eigengenes
+MEs <- moduleEigengenes(datExpr, colors = moduleColors)$eigengenes
+
+# Correlate module eigengenes with external traits
+MEcorrelations <- cor(MEs, traits, use = "p")
+MEpvalues <- corPvalueStudent(MEcorrelations, nrow(datExpr))
+
+
+```
+
+Heatmap of module correlations with external traits
+
+```{r}
+
+# How many genes per module
+moduleGeneCounts <- table(moduleColors)
+
+# Filter for top modules based on maximum absolute correlation
+maxCorrelationPerModule <- apply(abs(MEcorrelations), 1, max)
+topModules <- head(order(maxCorrelationPerModule, decreasing = TRUE), 10)
+filteredHeatmapData <- MEcorrelations[topModules, ]
+
+# Renaming columns for readability
+colnames(filteredHeatmapData) <- c("Disease Status", "Survival (Months)", "Tumor Grade")
+
+# Filter p-value matrix to include only top modules
+# Ensure the p-value matrix has the same row names as the original correlation matrix
+rownames(MEpvalues) <- rownames(MEcorrelations)
+filteredPvalues <- MEpvalues[topModules, ]
+
+# Formatting p-values for display
+formattedPvalues <- formatC(filteredPvalues, format="e", digits=2)
+
+# Melt the filtered heatmap data
+heatmap_data <- melt(as.matrix(filteredHeatmapData))
+
+# Melt the formatted p-values
+pvalue_data <- melt(as.matrix(formattedPvalues))
+
+# Combine the two datasets
+heatmap_data$pvalue <- pvalue_data$value
+
+
+# Define the maximum module size
+maxModuleSize <- 10000
+# Identify large modules
+largeModules <- names(which(moduleGeneCounts > maxModuleSize))
+# Adjust module names to match MEcorrelations format
+largeModules <- paste("ME", largeModules, sep="")
+# Filter out large modules from the heatmap data
+heatmap_data <- heatmap_data[!(heatmap_data$Var1) %in% largeModules, ]
+
+
+# Create the heatmap with ggplot2
+
+ggplot(heatmap_data, aes(Var2, Var1, fill = value)) +
+    geom_tile() +
+    geom_text(aes(label = round(value, 2)), color = "black", size = 3) +
+    scale_fill_gradient2(
+    low = "blue",
+    high = "red",
+    mid = "white",
+    midpoint = 0,
+    limits = c(-1, 1)) +
+    theme_minimal() +
+    xlab("Traits") + ylab("Modules") 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank())
+
+```
+
+Dendogram
+
+```{r}
+
+# Function to plot the dendrogram and module colors
+plotDendrogramAndModules <- function(net, title) {
+    mergedColors <- labels2colors(net$colors)
+
+    plotDendroAndColors(net$dendrograms[[1]], mergedColors[net$blockGenes[[1]]],
+                        main = title,
+                        dendroLabels = FALSE, hang = 0.03,
+                        addGuide = TRUE, guideHang = 0.05)
+}
+
+plotDendrogramAndModules(net, title = "Gene Dendrogram and Module Colors")
+
+```
+
+### Combined gene List Deprogram
+
+```{r fig.height=6, fig.width=8, message=FALSE, warning=TRUE}
+
+# Extract Gene Lists
+geneIDs <- rownames(datExpr)
+moduleGeneList <- split(geneIDs, moduleColors)
+selectedModules <- c("pink", "grey60", "greenyellow", "ivory", "blue", "turquoise")
+moduleGeneList <- split(colnames(datExpr), moduleColors)
+wgcnaGenes <- unlist(moduleGeneList[selectedModules])
+
+
+#PCA Genes
+pcaGenes <- names(important_genes_pc1)[1:1000]
+
+
+# Define thresholds for significance and log fold change
+significanceThreshold <- 0.05
+logFCThreshold <- 2
+# Filter the Limma results
+significantDEGs <- data[data$adj.P.Val < significanceThreshold & abs(data$logFC) > logFCThreshold, ]
+significantDEGIDs <- significantDEGs$ID
+
+# Create a list of the gene sets
+wgcnaGenes <- unique(wgcnaGenes)
+pcaGenes <- unique(pcaGenes)
+significantDEGIDs <- unique(significantDEGIDs)
+geneSets <- list(WGCNA = wgcnaGenes, PCA = pcaGenes, Limma = significantDEGIDs)
+
+
+# Create and plot the Venn diagram
+ggvenn <- ggVennDiagram(geneSets, category.names = c("WGCNA", "PCA", "DEGs"))
+print(ggvenn)
+
+
+
+
+
+```
+
+Get a list of genes that intersect
+
+```{r}
+# Intersection between WGCNA and PCA
+intersection_WGCNA_PCA <- intersect(wgcnaGenes, pcaGenes)
+
+# Intersection between WGCNA and DEGs
+intersection_WGCNA_DEGs <- intersect(wgcnaGenes, significantDEGIDs)
+
+# Intersection between WGCNA, PCA, and DEGs
+intersection_WGCNA_PCA_DEGs <- Reduce(intersect, list(wgcnaGenes, pcaGenes, significantDEGIDs))
+
+
+
+```
+
+### Gene Ontology
+
+Extract annotations and map to genes
+
+```{r}
+# Extract GO annotations and gene symbols
+goBP <- featureData$"Gene Ontology Biological Process"
+goCC <- featureData$"Gene Ontology Cellular Component"
+goMF <- featureData$"Gene Ontology Molecular Function"
+geneSymbols <- featureData$"Gene Symbol"
+
+# Modify gene symbols to match expression matrix
+modifiedGeneSymbols <- gsub(" /// ", "_", geneSymbols)
+
+# Create mapping
+goBP_mapped <- setNames(goBP, modifiedGeneSymbols)
+goCC_mapped <- setNames(goCC, modifiedGeneSymbols)
+goMF_mapped <- setNames(goMF, modifiedGeneSymbols)
+
+# Filter based on intersection_WGCNA_PCA_DEGs
+selected_goBP <- goBP_mapped[names(goBP_mapped) %in% intersection_WGCNA_PCA_DEGs]
+selected_goCC <- goCC_mapped[names(goCC_mapped) %in% intersection_WGCNA_PCA_DEGs]
+selected_goMF <- goMF_mapped[names(goMF_mapped) %in% intersection_WGCNA_PCA_DEGs]
+
+
+```
+
+Extract and Count GO Terms
+
+```{r}
+# Function to extract and count descriptive GO terms
+extractAndCountGODescriptions <- function(goList) {
+    unlisted <- unlist(goList)
+    goDescriptions <- sapply(strsplit(unlisted, " // "), function(x) x[2])  # Extracting descriptive terms
+    table(goDescriptions)
+}
+
+# Apply this function to each GO category
+goBP_descriptions <- extractAndCountGODescriptions(selected_goBP)
+goCC_descriptions <- extractAndCountGODescriptions(selected_goCC)
+goMF_descriptions <- extractAndCountGODescriptions(selected_goMF)
+
+
+```
+
+Plot frecuencies
+
+```{r}
+
+# Function to get top 5 terms
+getTop5 <- function(goData) {
+    goData_df <- as.data.frame(goData)
+    top5 <- head(goData_df[order(-goData_df$Freq), ], 15)
+    return(top5)
+}
+
+# Get top 5 terms for each category
+top15_BP <- getTop5(goBP_descriptions)
+top15_CC <- getTop5(goCC_descriptions)
+top15_MF <- getTop5(goMF_descriptions)
+
+
+# Biological Process
+ggplot(top15_BP, aes(x = reorder(goDescriptions, Freq), y = Freq)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    labs(x = "GO Term Description", y = "Frequency", title = "Top 5 GO Biological Process Terms") +
+    theme_minimal()
+
+
+
+```
+
+## 7. Survival Analysis
+
+### Cox Proportional Hazards Model
+
+```{r}
+
+# Filter clinical data to include only patients with tumors
+alignedClinicalData <- traits
+tumorClinicalData <- alignedClinicalData[alignedClinicalData$'disease:ch1' == 1, ]
+
+# Filter matrix by selected genes
+selectedExpressionData <- glioblastoma_expressionMatrix[rownames(glioblastoma_expressionMatrix) %in% intersection_WGCNA_PCA_DEGs, ]
+# Align expression data with filtered clinical data
+tumorExpressionData <- selectedExpressionData[, colnames(selectedExpressionData) %in% rownames(tumorClinicalData)]
+
+# Create a Survival object with all observations treated as censored
+survData <- Surv(time = tumorClinicalData$OVERALL_SURVIVAL_MONTHS)
+
+# Function to run Cox regression for each gene
+runCoxModel <- function(expressionData, survData) {
+    results <- apply(expressionData, 1, function(geneExpression) {
+        coxModel <- coxph(survData ~ geneExpression)
+        summary(coxModel)$coef  # Extract coefficients and other relevant statistics
+    })
+    return(t(results)) # Transpose for better organization
+}
+
+# Run Cox model
+coxResults <- runCoxModel(tumorExpressionData, survData)
+
+```
+
+Filter and Analyze Results
+
+```{r}
+# Colnames
+coxResultsDF <- as.data.frame(coxResults)
+colnames(coxResultsDF) <- c("Coefficient", "HazardRatio", "StdError", "Zvalue", "Pvalue")
+
+# Sorting by p-value (ascending order) and then by Hazard Ratio (descending order for positive impact)
+sortedResults <- coxResultsDF[order(coxResultsDF$Pvalue, -abs(coxResultsDF$HazardRatio)),]
+
+# Selecting significant genes
+significanCoxtResults <- sortedResults[sortedResults$Pvalue < 0.05,]
+
+```
+
+### Random Forest Survival
+
+Select Optimal number of trees
+
+```{r}
+
+# Prepare the data
+tumorExpressionDataDF <- as.data.frame(t(tumorExpressionData))
+tumorExpressionDataDF$survTime <- tumorClinicalData$OVERALL_SURVIVAL_MONTHS
+tumorExpressionDataDF$survEvent <- rep(1, nrow(tumorClinicalData)) 
+
+# Fit the Random Forest model and record OOB error
+ntreeRange <- seq(1, 1000, by = 10)
+oobErrorRate <- numeric(length(ntreeRange))
+
+for (i in seq_along(ntreeRange)) {
+    rfModel <- rfsrc(Surv(survTime, survEvent) ~ ., data = tumorExpressionDataDF, ntree = ntreeRange[i])
+    oobErrorRate[i] <- rfModel$err.rate[length(rfModel$err.rate)]  # Last element of err.rate
+}
+
+# Plotting the OOB Error Rate
+plot(ntreeRange, oobErrorRate, type = "b", xlab = "Number of Trees", ylab = "OOB Error Rate",
+     main = "OOB Error Rate vs. Number of Trees in Random Forest")
+
+
+```
+
+Fit the Model
+
+```{r}
+
+# Fit the Random Forest survival model
+rfModel <- rfsrc(Surv(survTime, survEvent) ~ ., data = tumorExpressionDataDF, 
+                 ntree = 100, importance = TRUE)
+
+# Print the model summary
+print(rfModel)
+
+```
+
+Extract Variable Importance
+
+```{r}
+# Extract variable importance
+var_importance <- rfModel$importance
+
+# Create a dataframe from the variable importance
+importance_df <- data.frame(Variable = names(var_importance), Importance = var_importance)
+
+# Sort the dataframe by importance
+sorted_importance_df <- importance_df[order(-importance_df$Importance), ]
+
+# Selecting top 3 genes based on absolute Z-value
+top_genes_cox <- significanCoxtResults[order(abs(significanCoxtResults$Zvalue), decreasing = TRUE), ][1:4, ]
+# Assuming sorted_importance_df is your sorted variable importance dataframe from Random Forest
+top_genes_rf <- head(sorted_importance_df, 4)
+```
+
+### Pairwise Comparison of Survival
+
+```{r fig.height=11, fig.width=8.5, warning=FALSE}
+
+# Combine and get unique gene names
+genes_cox <- rownames(top_genes_cox)
+genes_rf <- rownames(top_genes_rf)
+selected_genes <- unique(c(genes_cox, genes_rf))
+selected_genes <- gsub("^X", "", selected_genes)
+
+# delete
+# Genes to be removed
+genes_to_remove <- c("4098", "USH1C")
+# Remove the specified genes from the vector
+selected_genes <- selected_genes[!selected_genes %in% genes_to_remove]
+
+# Extract relevant data
+analysis_df <- tumorExpressionDataDF[c(selected_genes, "survTime", "survEvent")]
+
+# List to store plots
+plot_list <- list()
+num_genes <- length(selected_genes)
+
+# Loop through each gene to perform survival analysis
+for (i in 1:num_genes) {
+    gene <- selected_genes[i]
+
+    # Dichotomize expression levels
+    median_expression <- median(analysis_df[[gene]], na.rm = TRUE)
+    analysis_df[[paste(gene, "group", sep = "_")]] <- ifelse(analysis_df[[gene]] >= median_expression, "High", "Low")
+
+    # Create a Survival object
+    surv_obj <- Surv(analysis_df$survTime, analysis_df$survEvent)
+
+    # Fit Kaplan-Meier survival curve
+    fit <- survfit(surv_obj ~ analysis_df[[paste(gene, "group", sep = "_")]])
+
+    # Plot the survival curve using ggsurvplot without a legend
+    p <- ggsurvplot(fit, 
+                data = analysis_df, 
+                pval = TRUE, 
+                conf.int = FALSE, 
+                risk.table = TRUE, 
+                title = gene,
+                legend = "none",  # No legend for individual plots
+                xlab = ifelse(i %in% c(5, 6), "Time (months)", ""),  # X-axis label only for bottom plots
+                ylab = ifelse(i %% 2 != 0, "Survival Probability", ""),  # Y-axis label only for left column
+                xlim = c(0, 30),
+                palette = c("#00BA38", "#F8766D"))
+
+# Modify the plot to change the X-axis ticks
+p$plot <- p$plot + scale_x_continuous(breaks = seq(0, 30, by = 5))  # Adjust 'by' to change the tick interval
+
+# Add the modified plot to the list
+plot_list[[i]] <- p$plot
+}
+
+# Create a separate plot for the legend
+legend_plot <- get_legend(ggsurvplot(fit, data = analysis_df, risk.table = TRUE, legend.title = "Expression", legend.labs = c("High", "Low"), legend = "right", palette = c("#00BA38", "#F8766D"))$plot)
+
+
+# Arrange plots in a 2x3 grid
+grid.arrange(grobs = plot_list, ncol = 2, nrow = 3)
+# Start PDF device
+pdf("my_grid_plot.pdf", width = 8.5, height = 11)
+# Create and plot the grid
+grid.arrange(grobs = plot_list, ncol = 2, nrow = 3)
+# Close the device to save the file
+dev.off()
+
+
+
+```
+
+Gene Importance vs. Hazard Ratio
+
+```{r}
+
+# Convert row names to a column in each data frame
+sortedResults$Gene <- rownames(sortedResults)
+sorted_importance_df$Gene <- rownames(sorted_importance_df)
+
+# Function to find and replace similar gene names based on a threshold
+replace_similar_names <- function(name, name_list, threshold = 0.5) {
+  # Calculate similarity scores
+  similarities <- stringdist::stringdistmatrix(name, name_list, method = "jaccard")
+  max_similarity <- 1 - similarities  # Convert distance to similarity
+  
+  # Find the best match if it exceeds the threshold
+  if (max(max_similarity) >= threshold) {
+    best_match <- name_list[which.max(max_similarity)]
+    return(best_match)
+  } else {
+    return(name)
+  }
+}
+
+# Apply the function to each gene name in one of the datasets
+sortedResults$Gene <- sapply(sortedResults$Gene, replace_similar_names, name_list = sorted_importance_df$Gene)
+
+# Merging the data frames by Gene with a full outer join
+merged_df <- merge(sortedResults, sorted_importance_df, by = "Gene", all = TRUE)
+
+
+
+
+
+
+```
+
+Plot
+
+```{r}
+# List of specific genes to label
+genes_to_label <- c("AVPR1A1", "NFE4", "6369", "3838", "LOC100293704_MIR8072", "UGGT11")
+
+
+
+# Define the significance threshold
+significance_threshold <- 0.05
+
+# Create the scatter plot with conditional coloring
+ggplot(merged_df, aes(x = Importance, y = HazardRatio)) +
+  geom_point(aes(color = ifelse(Pvalue < significance_threshold, Pvalue, NA)), size = 2) +
+  scale_color_gradientn(colors = c("red", "blue"), 
+                        trans = "log10", 
+                        name = "P-value", 
+                        na.value = "blue") +  # Non-significant genes colored black
+  geom_text(data = subset(merged_df, Gene %in% genes_to_label), 
+            aes(label = Gene, x = Importance, y = HazardRatio), 
+            hjust = 1.1, vjust = 1.1) +
+  labs(title = "Distribution of Importance and Hazard Ratio",
+       x = "Importance",
+       y = "Hazard Ratio") +
+  theme_bw() +
+  theme(legend.position = "right")
+
+```
+
+### Bio marker Expression Levels
+
+```{r}
+
+
+# Subset Expression Data
+selected_expression <- glioblastoma_expressionMatrix[selected_genes, ]
+
+# Filter alignedClinicalData for relevant samples
+relevant_samples <- alignedClinicalData[alignedClinicalData$'disease:ch1' %in% c(0, 1), ]
+
+# Match sample IDs between expression data and clinical data
+matched_expression <- selected_expression[, rownames(relevant_samples)]
+
+
+# Convert 'disease:ch1' to a factor
+relevant_samples$'disease:ch1' <- factor(relevant_samples$'disease:ch1', levels = c(0, 1), labels = c("Normal", "Tumor"))
+
+# Function to perform t-test for each gene
+get_p_value <- function(gene) {
+  gene_data <- matched_expression[gene, ]
+  test <- t.test(gene_data ~ relevant_samples$'disease:ch1')
+  return(test$p.value)
+}
+
+# Apply the function to each gene
+gene_list <- rownames(matched_expression)
+p_values <- sapply(gene_list, get_p_value)
+p_values_adjusted <- p.adjust(p_values, method = "BH")  # Adjust for multiple testing
+
+# Convert to data frame
+p_values_df <- data.frame(Gene = gene_list, p_value = p_values_adjusted)
+
+# Transform matched_expression to long format for plotting
+long_expression <- melt(matched_expression)
+long_expression$Status <- relevant_samples$'disease:ch1'[match(long_expression$Var2, rownames(relevant_samples))]
+
+
+
+# Annotations for p-value
+signif_data <- data.frame(
+  gene = p_values_df$Gene,
+  group1 = "Normal",
+  group2 = "Tumor",
+  pval = p_values_df$p_value
+)
+
+
+
+# Create a box-and-whisker plot
+ggplot(long_expression, aes(x = Var1, y = value, fill = factor(Status))) +
+  geom_boxplot(position = position_dodge(width = 0.75)) +  # Align the boxes side by side
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.5, dodge.width = 0.75), size = 1, alpha = 0.3) +  # Spread the points appropriately
+  labs(x = "Gene", y = "Expression Level", fill = "Sample Status") +
+  theme_minimal() +
+  facet_wrap(~ Var1, scales = "free")
+```
+
+Plot
+
+```{r}
+
+# Plotting the data
+plot <- ggplot(long_expression, aes(x = Var1, y = value, fill = factor(Status))) +
+  geom_boxplot(position = position_dodge(width = 0.75)) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.5, dodge.width = 0.75), size = 1, alpha = 0.3) +
+  labs(x = "Gene", y = "Expression Level", fill = "Sample Status") +
+  theme_minimal() +
+  facet_wrap(~ Var1, scales = "free")
+
+# Adding significance annotations
+
+plot + geom_signif(stat = "identity", data = signif_data, aes(xmin = group1, xmax = group2, annotations = format(pval, scientific = TRUE), y_position = max(value)),
+                   manual = TRUE, vjust = -0.2)
+
+print(plot)
+
+
+
+
+
+```
