@@ -1,0 +1,18 @@
+# Ignore R project files
+.Rproj.user
+.RData
+.Rhistory
+
+# Ignore log files and temporary files
+*.log
+*.RData
+
+# Ignore specific large data files
+TOMData-block.*.RData
+
+# Ignore the Plots directory 
+Plots/
+
+# Ignore other directories and files as needed
+CompleteAnalysis_files/
+my_grid_plot.pdf
